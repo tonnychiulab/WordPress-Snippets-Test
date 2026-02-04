@@ -1,0 +1,143 @@
+/**
+ * 在儀表板新增「最佔資源圖片監控」小工具
+ * 
+ * * 為什麼這樣做：
+ *   讓管理者一登入後台就能立刻發現是否有人上傳了未經壓縮的巨型圖片。
+ *   這些圖片是導致網頁載入變慢 ("最花時間") 的主要元兇。
+ *
+ * * 安全性與效能：
+ *   只有具備 `upload_files` 權限的角色 (如管理員、編輯) 才能看到此區塊。
+ *   採用 Transient 快取機制，避免每次重新整理頁面都掃描檔案系統，造成後台卡頓。
+ */
+function my_add_heavy_images_dashboard_widget() {
+	if ( current_user_can( 'upload_files' ) ) {
+		wp_add_dashboard_widget(
+			'my_heavy_images_widget',            // Widget ID
+			'⚠️ 最花載入時間的圖片 (Top 5 肥大圖)', // 標題
+			'my_render_heavy_images_widget'      // 顯示內容的 Callback
+		);
+	}
+}
+add_action( 'wp_dashboard_setup', 'my_add_heavy_images_dashboard_widget' );
+
+/**
+ * 渲染小工具內容
+ */
+function my_render_heavy_images_widget() {
+	// 取得分析資料
+	$heavy_images = my_get_largest_images();
+
+	if ( empty( $heavy_images ) ) {
+		echo '<p>目前沒有偵測到圖片資料。</p>';
+		return;
+	}
+
+	echo '<div class="main">';
+	echo '<table class="widefat striped" style="border:0;">';
+	echo '<thead><tr>
+			<th style="color:#666;">預覽</th>
+			<th style="color:#666;">路徑與資訊</th>
+			<th style="color:#b32d2e;">大小</th>
+		  </tr></thead>';
+	echo '<tbody>';
+
+	foreach ( $heavy_images as $img ) {
+		$edit_link = get_edit_post_link( $img['id'] );
+		$file_ext  = strtoupper( pathinfo( $img['path'], PATHINFO_EXTENSION ) );
+		
+		echo '<tr>';
+		// 預覽圖
+		echo '<td style="width:60px; vertical-align:top;">';
+		echo '<a href="' . esc_url( $edit_link ) . '"><img src="' . esc_url( $img['url'] ) . '" style="width:50px; height:50px; object-fit:cover; border-radius:4px; border:1px solid #ddd;"></a>';
+		echo '</td>';
+		
+		// 路徑與格式
+		echo '<td>';
+		echo '<strong>' . esc_html( $img['filename'] ) . '</strong><br/>';
+		echo '<span style="color:#888; font-size:11px;">格式: ' . esc_html( $file_ext ) . '</span><br/>';
+		echo '<a href="' . esc_url( $edit_link ) . '" style="text-decoration:none; font-size:12px;">編輯媒體</a>';
+		echo '</td>';
+
+		// 大小 (超過 1MB 顯示紅色警告)
+		$size_color = $img['bytes'] > 1048576 ? '#b32d2e' : '#2271b1';
+		echo '<td style="vertical-align:top; font-weight:bold; color:' . esc_attr( $size_color ) . ';">';
+		echo esc_html( size_format( $img['bytes'], 1 ) );
+		echo '</td>';
+		echo '</tr>';
+	}
+
+	echo '</tbody></table>';
+	echo '<p style="text-align:right; font-size:11px; color:#999; margin-top:5px;">* 資料快取每小時更新一次</p>';
+	// 新增一個手動更新按鈕的連結 (透過 query arg)
+	$refresh_url = add_query_arg( 'my_force_refresh_images', '1' );
+	echo '<a href="' . esc_url( $refresh_url ) . '" class="button button-small">強制重新掃描</a>';
+	echo '</div>';
+}
+
+/**
+ * 取得最大圖片的邏輯函式 (含快取)
+ *
+ * * Tricky Logic (複雜邏輯說明)：
+ *   WordPress 資料庫預設沒有將「檔案大小 (File Size)」存為可排序的獨立欄位 (它是序列化在 meta 中)。
+ *   因此，要精確找出全站最大圖片，必須透過 PHP 迴圈檢查 `filesize()`。
+ *   為了避免圖片幾萬張時導致 PHP 超時 (Timeout)，這裡限制只檢查「最近上傳的 250 張」圖片。
+ *
+ * @return array 包含圖片資訊的陣列
+ */
+function my_get_largest_images() {
+	// 1. 檢查是否有點擊「強制重新掃描」
+	if ( isset( $_GET['my_force_refresh_images'] ) && '1' === $_GET['my_force_refresh_images'] ) {
+		delete_transient( 'my_heavy_images_cache' );
+	}
+
+	// 2. 嘗試讀取快取
+	$cached_data = get_transient( 'my_heavy_images_cache' );
+	if ( false !== $cached_data ) {
+		return $cached_data;
+	}
+
+	// 3. 若無快取，執行查詢
+	$args = array(
+		'post_type'      => 'attachment',
+		'post_status'    => 'inherit',
+		'post_mime_type' => 'image',
+		'posts_per_page' => 250, // 效能考量：僅掃描最近的 250 張
+		'fields'         => 'ids', // 僅取 ID 以節省記憶體
+	);
+
+	$query = new WP_Query( $args );
+	$image_data = array();
+
+	if ( $query->have_posts() ) {
+		foreach ( $query->posts as $post_id ) {
+			// 取得實際檔案路徑
+			$file_path = get_attached_file( $post_id );
+			
+			// 檢查檔案是否存在，以避免錯誤
+			if ( file_exists( $file_path ) ) {
+				$size = filesize( $file_path );
+				
+				$image_data[] = array(
+					'id'       => $post_id,
+					'filename' => basename( $file_path ),
+					'path'     => $file_path,
+					'url'      => wp_get_attachment_url( $post_id ),
+					'bytes'    => $size,
+				);
+			}
+		}
+	}
+
+	// 4. 根據檔案大小排序 (由大到小)
+	usort( $image_data, function( $a, $b ) {
+		return $b['bytes'] <=> $a['bytes'];
+	} );
+
+	// 5. 取出前 5 名
+	$top_images = array_slice( $image_data, 0, 5 );
+
+	// 6. 寫入快取，保存 1 小時 (3600 秒)
+	set_transient( 'my_heavy_images_cache', $top_images, 3600 );
+
+	return $top_images;
+}
