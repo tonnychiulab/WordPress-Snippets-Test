@@ -1,0 +1,119 @@
+/**
+ * 註冊 REST API 路由：串流代理下載
+ *
+ * @return void
+ */
+function my_register_backup_proxy_route() {
+	register_rest_route( 'my-plugin/v1', '/proxy-download', array(
+		'methods'             => 'GET',
+		'callback'            => 'my_handle_proxy_download',
+		'permission_callback' => function () {
+			/**
+			 * 安全性檢查：
+			 * 僅允許具備 'manage_options' (管理員) 權限的使用者存取。
+			 * 防止未經授權的人員利用此端點消耗伺服器頻寬或下載敏感資料。
+			 */
+			return current_user_can( 'manage_options' );
+		},
+		'args'                => array(
+			'url' => array(
+				'required'          => true,
+				'validate_callback' => function ( $param ) {
+					return wp_http_validate_url( $param );
+				},
+			),
+		),
+	) );
+}
+add_action( 'rest_api_init', 'my_register_backup_proxy_route' );
+
+/**
+ * 處理串流下載的 Callback 函式
+ *
+ * * 為什麼這樣做：
+ *   傳統的 file_get_contents() 會將整個檔案載入記憶體，如果檔案過大 (如備份檔)，
+ *   會立刻導致 PHP 發生 "Fatal error: Allowed memory size exhausted"。
+ *   
+ *   此函式使用 fopen() 配合 while 迴圈與 flush()，每次只讀取一小塊 (Chunk) 資料
+ *   並立即輸出給瀏覽器，讓伺服器記憶體使用量維持在極低水平。
+ *
+ * * Tricky Logic (複雜邏輯說明)：
+ *   1. 我們必須先清除所有 PHP 輸出緩衝區 (Output Buffering)，否則資料會卡在伺服器記憶體中直到腳本結束。
+ *   2. 使用 set_time_limit(0) 防止下載大檔案時 PHP 腳本因執行時間過長而被中斷。
+ *
+ * @param WP_REST_Request $request REST API 請求物件
+ * @return void 直接輸出檔案內容並結束執行
+ */
+function my_handle_proxy_download( $request ) {
+	$remote_url = $request->get_param( 'url' );
+
+	// 再次驗證 URL 安全性，確保不會被用來掃描內部網路 (SSRF 防護)
+	// wp_safe_remote_get 包含了一系列針對 SSRF 的檢查邏輯
+	// 但因為我們要用 fopen 串流，這裡僅做基礎 URL 格式驗證，
+	// 若需嚴格 SSRF 防護，建議限制 $remote_url 的網域白名單。
+	if ( ! wp_http_validate_url( $remote_url ) ) {
+		return new WP_Error( 'invalid_url', '無效的 URL', array( 'status' => 400 ) );
+	}
+
+	// 嘗試開啟遠端檔案串流
+	// 注意：這需要伺服器 php.ini 設定 allow_url_fopen = On
+	// @ 符號用於抑制連線失敗時的 PHP 警告，改由下方邏輯處理錯誤
+	$file_handle = @fopen( $remote_url, 'rb' );
+
+	if ( ! $file_handle ) {
+		return new WP_Error( 'remote_error', '無法連線至遠端檔案', array( 'status' => 502 ) );
+	}
+
+	// 1. 取得遠端檔案的 Headers (選擇性優化)
+	// 為了讓瀏覽器知道進度條，我們可以嘗試取得檔案大小。
+	// 這裡簡單使用 get_headers (需注意效能)，或直接以串流傳輸 (Unknown size)。
+	$headers = @get_headers( $remote_url, true );
+	$file_size = isset( $headers['Content-Length'] ) ? $headers['Content-Length'] : 0;
+	$content_type = isset( $headers['Content-Type'] ) ? $headers['Content-Type'] : 'application/octet-stream';
+	
+	// 從 URL 取得檔名，預設為 backup.zip
+	$filename = basename( parse_url( $remote_url, PHP_URL_PATH ) );
+	if ( empty( $filename ) ) {
+		$filename = 'backup.zip';
+	}
+
+	// 2. 設定回應 Headers，告訴瀏覽器這是一個下載檔案
+	header( 'Content-Description: File Transfer' );
+	header( 'Content-Type: ' . $content_type );
+	header( 'Content-Disposition: attachment; filename="' . $filename . '"' );
+	header( 'Content-Transfer-Encoding: binary' );
+	header( 'Expires: 0' );
+	header( 'Cache-Control: must-revalidate' );
+	header( 'Pragma: public' );
+
+	if ( $file_size ) {
+		header( 'Content-Length: ' . $file_size );
+	}
+
+	// 3. 關閉輸出緩衝，確保立即傳輸
+	if ( function_exists( 'apache_setenv' ) ) {
+		@apache_setenv( 'no-gzip', 1 ); // 禁止 Apache 再次壓縮
+	}
+	while ( ob_get_level() ) {
+		ob_end_clean();
+	}
+
+	// 解除 PHP 執行時間限制 (針對大檔案)
+	set_time_limit( 0 );
+
+	// 4. 開始串流傳輸 (Pipeline)
+	// 每次讀取 8KB (8192 bytes)
+	while ( ! feof( $file_handle ) ) {
+		echo fread( $file_handle, 8192 );
+		flush(); // 強制將緩衝區內容發送給客戶端
+		
+		// 如果客戶端斷線，停止下載以節省頻寬
+		if ( connection_status() != 0 ) {
+			@fclose( $file_handle );
+			exit;
+		}
+	}
+
+	fclose( $file_handle );
+	exit; // 確保沒有其他 WordPress 輸出干擾
+}
